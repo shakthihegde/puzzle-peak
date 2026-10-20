@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Inline src/ into two single-file builds: dist/index.html (artifact page body) and dist/puzzle-peak.html (standalone)."""
-import json, pathlib
+import json, os, pathlib
 root = pathlib.Path(__file__).parent
 src = root / 'src'
 order = json.loads((src / 'order.json').read_text())
 js = '\n'.join((src / f).read_text() for f in order)
+# Sync service address for the hosted site. Forks: deploy cloudflare/ and put your own address here (or leave it empty).
+SYNC_URL = os.environ.get('SYNC_URL', (root / 'cloudflare' / 'sync-url.txt').read_text().strip() if (root / 'cloudflare' / 'sync-url.txt').exists() else '')
+site_js = js.replace('__SYNC_URL__', SYNC_URL)
+js = js.replace('__SYNC_URL__', '')
 css = (src / 'style.css').read_text()
 fonts = '<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Lexend:wght@400;500;600&display=swap">'
 body = f'''<title>Puzzle Peak</title>
@@ -36,7 +40,7 @@ print(f"built: {len(body)/1024:.0f} KB")
 import hashlib, shutil
 site = root / 'docs'
 site.mkdir(exist_ok=True)
-version = hashlib.sha1(body.encode()).hexdigest()[:10]
+version = hashlib.sha1((body + site_js).encode()).hexdigest()[:10]
 head_extra = '''<meta name="robots" content="noindex, nofollow">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
@@ -45,7 +49,7 @@ head_extra = '''<meta name="robots" content="noindex, nofollow">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="mobile-web-app-capable" content="yes">'''
 sw_register = '<script>if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(function () {});</script>'
-site_html = standalone.replace('<meta name="theme-color" content="#1e8f96">', '<meta name="theme-color" content="#1e8f96">\n' + head_extra).replace('</body></html>', sw_register + '\n</body></html>')
+site_html = standalone.replace(js, site_js).replace('<meta name="theme-color" content="#1e8f96">', '<meta name="theme-color" content="#1e8f96">\n' + head_extra).replace('</body></html>', sw_register + '\n</body></html>')
 (site / 'index.html').write_text(site_html)
 (site / 'manifest.webmanifest').write_text(json.dumps({
     "name": "Puzzle Peak", "short_name": "Puzzle Peak", "description": "Gifted-test practice with explanations",

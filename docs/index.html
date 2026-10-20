@@ -2282,6 +2282,10 @@ Penguins eat cold fish
 })();
 
 'use strict';
+// Address of the sync service (cloudflare/). build.py fills it in for the hosted site; empty means sync is off.
+PP.SYNC_URL = 'https://puzzle-peak-sync.puzzle-peak-sync.workers.dev';
+
+'use strict';
 // UI: home, chapters, practice quizzes, timed tests, results, progress report, trophies.
 (function () {
   const app = document.getElementById('app');
@@ -2295,21 +2299,56 @@ Penguins eat cold fish
   const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.max(0, s) % 60).padStart(2, '0')}`;
 
   // ================= saved progress =================
-  const blank = () => ({ v: 1, name: '', sound: true, xp: 0, correct: 0, answered: 0, bestStreak: 0, timeMs: 0, sets: {}, stats: {}, tests: [], mistakes: {}, fixed: {}, fixedCount: 0, badges: {}, daily: {}, last: '', parent: { pin: '', lock: false } });
-  let S = blank();
-  try { const raw = localStorage.getItem(KEY); if (raw) S = Object.assign(blank(), JSON.parse(raw)); } catch (e) { /* storage unavailable */ }
-  function save() {
-    try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { /* storage unavailable */ }
-    Sync.push();
+  // Counters live per device (byDev) so progress from several devices adds up instead of overlapping;
+  // the totals on S (answered, correct, xp, stats …) are recomputed from them.
+  let DEV = 'dtemp';
+  try { DEV = localStorage.getItem('pp-device') || ''; if (!DEV) { DEV = 'd' + Math.random().toString(36).slice(2, 10); localStorage.setItem('pp-device', DEV); } } catch (e) { DEV = 'dtemp'; }
+  const rid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+  const COUNTERS = ['answered', 'correct', 'timeMs', 'xp', 'fixedCount'];
+  const blank = () => ({ v: 2, name: '', sound: true, xp: 0, correct: 0, answered: 0, bestStreak: 0, timeMs: 0, sets: {}, stats: {}, tests: [], mistakes: {}, fixed: {}, fixedCount: 0, badges: {}, daily: {}, last: '', parent: { pin: '', lock: false }, byDev: {}, epoch: { id: '', t: 0 } });
+  const devBlank = () => ({ answered: 0, correct: 0, timeMs: 0, xp: 0, fixedCount: 0, stats: {} });
+  function totals(o) {
+    COUNTERS.forEach((k) => { o[k] = 0; }); o.stats = {};
+    for (const d of Object.values(o.byDev)) {
+      COUNTERS.forEach((k) => { o[k] += d[k] || 0; });
+      for (const ch in d.stats || {}) { const t = o.stats[ch] || (o.stats[ch] = [0, 0, 0]); d.stats[ch].forEach((v, i) => { t[i] += v; }); }
+    }
+    return o;
   }
+  // older saves and old transfer codes only have totals: file them under one device id
+  function normalize(x, dev) {
+    const o = Object.assign(blank(), x);
+    if (!x.byDev) { const d = devBlank(); COUNTERS.forEach((k) => { d[k] = x[k] || 0; }); d.stats = JSON.parse(JSON.stringify(x.stats || {})); o.byDev = { [dev]: d }; }
+    return totals(o);
+  }
+  let S = blank();
+  try { const raw = localStorage.getItem(KEY); if (raw) S = normalize(JSON.parse(raw), DEV); } catch (e) { /* storage unavailable */ }
+  const me = () => S.byDev[DEV] || (S.byDev[DEV] = devBlank());
+  const addXP = (n) => { me().xp += n; S.xp += n; };
+  function saveLocal() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { /* storage unavailable */ } }
+  function save() { saveLocal(); Sync.push(); }
   function merge(a, b) {
+    a = a.byDev ? a : normalize(a, DEV);
+    b = b.byDev ? b : normalize(b, 'import-' + PP.hash(JSON.stringify([b.answered, b.xp, b.stats])).toString(36));
+    // a reset starts a new epoch: the newer epoch replaces older progress instead of merging with it
+    const ea = a.epoch || { t: 0 }, eb = b.epoch || { t: 0 };
+    if (ea.t && eb.t && ea.id !== eb.id) { const win = ea.t > eb.t ? a : b; return totals(Object.assign(blank(), JSON.parse(JSON.stringify(win)), { name: a.name || win.name, sound: a.sound, parent: a.parent })); }
     const o = Object.assign(blank(), b, a);
-    ['xp', 'correct', 'answered', 'bestStreak', 'fixedCount', 'timeMs'].forEach((k) => { o[k] = Math.max(a[k] || 0, b[k] || 0); });
+    o.sound = a.sound !== undefined ? a.sound : b.sound !== undefined ? b.sound : true;
+    o.epoch = ea.t ? ea : eb;
+    o.bestStreak = Math.max(a.bestStreak || 0, b.bestStreak || 0);
     o.name = a.name || b.name || '';
     o.sets = Object.assign({}, b.sets, a.sets);
     for (const k in b.sets || {}) { const x = (a.sets || {})[k], y = b.sets[k]; if (x && y) o.sets[k] = { best: Math.max(x.best, y.best), stars: Math.max(x.stars, y.stars), n: Math.max(x.n, y.n) }; }
-    o.stats = Object.assign({}, b.stats);
-    for (const k in a.stats || {}) { const x = a.stats[k], y = o.stats[k]; o.stats[k] = y ? x.map((v, i) => Math.max(v, y[i] || 0)) : x; }
+    o.byDev = {};
+    for (const id of new Set([...Object.keys(a.byDev), ...Object.keys(b.byDev)])) {
+      const x = a.byDev[id], y = b.byDev[id];
+      if (!x || !y) { o.byDev[id] = JSON.parse(JSON.stringify(x || y)); continue; }
+      const d = devBlank();
+      COUNTERS.forEach((k) => { d[k] = Math.max(x[k] || 0, y[k] || 0); });
+      for (const ch of new Set([...Object.keys(x.stats || {}), ...Object.keys(y.stats || {})])) { const p = (x.stats || {})[ch] || [0, 0, 0], q = (y.stats || {})[ch] || [0, 0, 0]; d.stats[ch] = p.map((v, i) => Math.max(v, q[i] || 0)); }
+      o.byDev[id] = d;
+    }
     const seen = new Set();
     o.tests = [...(a.tests || []), ...(b.tests || [])].filter((t) => { const k = t.id + t.form + t.date; if (seen.has(k)) return false; seen.add(k); return true; }).sort((x, y) => y.date - x.date).slice(0, 60);
     o.fixed = Object.assign({}, b.fixed, a.fixed);
@@ -2318,7 +2357,7 @@ Penguins eat cold fish
     o.badges = Object.assign({}, b.badges, a.badges);
     o.daily = Object.assign({}, b.daily, a.daily);
     o.parent = a.parent && a.parent.pin ? a.parent : b.parent || a.parent || { pin: '', lock: false };
-    return o;
+    return totals(o);
   }
   // Optional cross-device sync when the page runs inside a signed-in claude.ai viewer.
   const Sync = {
@@ -2332,7 +2371,7 @@ Penguins eat cold fish
         if (!uid) return;
         this.ref = db.doc('data/users/' + uid + '/progress');
         const snap = await this.ref.get();
-        if (snap.exists && snap.data().s) { S = merge(S, JSON.parse(snap.data().s)); try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { /* ignore */ } }
+        if (snap.exists && snap.data().s) { S = merge(S, JSON.parse(snap.data().s)); saveLocal(); }
         this.on = true;
         this.dirty = true; this.flush();
         if (!Q && !T) render();
@@ -2345,6 +2384,56 @@ Penguins eat cold fish
       try { await this.ref.set({ s: JSON.stringify(S), at: Date.now() }); } catch (e) { if (e && e.code === 'invalid_argument') this.on = false; }
       this.busy = false;
       if (this.dirty) this.flush();
+    },
+  };
+
+  // Optional sync between devices through a tiny Cloudflare service (cloudflare/src/worker.js).
+  // One record per family code: load the server copy, merge it with this device, save the merged result back.
+  // Only progress is sent (no name, no settings). Without PP.SYNC_URL (forks, offline file) this stays off.
+  const SYNC_KEY = 'pp-sync';
+  let C = {};
+  try { C = JSON.parse(localStorage.getItem(SYNC_KEY) || '{}'); } catch (e) { C = {}; }
+  const KEY_RE = /^peak(-[a-z0-9]{4}){4}$/;
+  const newFamilyCode = () => { const al = 'abcdefghijkmnpqrstuvwxyz23456789', a = new Uint8Array(16); crypto.getRandomValues(a); return 'peak-' + Array.from(a, (b) => al[b % 32]).join('').match(/.{4}/g).join('-'); };
+  const Cloud = {
+    busy: false, again: false, lastTry: 0,
+    available() { return !!PP.SYNC_URL; },
+    on() { return this.available() && KEY_RE.test(C.key || ''); },
+    saveCfg() { try { localStorage.setItem(SYNC_KEY, JSON.stringify(C)); } catch (e) { /* ignore */ } },
+    statusText() {
+      if (!this.on()) return 'Off. Progress is saved on this device only.';
+      if (this.busy) return 'Syncing…';
+      if (C.err) return `Couldn’t sync just now (${esc(C.err)}). It will try again automatically.`;
+      if (C.last) { const m = Math.round((Date.now() - C.last) / 60000); return `On ✓ Last synced ${m < 1 ? 'just now' : m < 60 ? m + ' min ago' : new Date(C.last).toLocaleString()}.`; }
+      return 'On.';
+    },
+    showStatus() { const el = document.getElementById('pp-sync-status'); if (el) el.innerHTML = this.statusText(); },
+    async call(path, body) {
+      const r = await fetch(PP.SYNC_URL + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), cache: 'no-store' });
+      return r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status }));
+    },
+    async sync() {
+      if (!this.on() || navigator.onLine === false) return;
+      if (this.busy) { this.again = true; return; }
+      this.busy = true; this.lastTry = Date.now(); this.showStatus();
+      try {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const got = await this.call('/v1/load', { key: C.key });
+          if (!got.ok) throw new Error(got.error || 'server error');
+          if (got.data) S = merge(S, await unpackState(got.data));
+          else if (!S.epoch || !S.epoch.t) S.epoch = { id: rid(), t: Date.now() };
+          saveLocal();
+          const data = await packState(true);
+          if (got.data === data) break;
+          const put = await this.call('/v1/save', { key: C.key, data, base: got.updated });
+          if (put.ok) break;
+          if (!put.conflict) throw new Error(put.error || 'server error');
+        }
+        C.last = Date.now(); C.err = '';
+        if (['home', 'progress', 'trophies', 'mix', 'chapter', 'mistakes'].includes(view.name)) render();
+      } catch (e) { C.err = String((e && e.message) || e).slice(0, 80); }
+      this.saveCfg(); this.busy = false; this.showStatus();
+      if (this.again) { this.again = false; this.sync(); }
     },
   };
 
@@ -2525,12 +2614,12 @@ Penguins eat cold fish
     return sess.qs[i];
   }
   function record(q, ok, ms, kind) {
-    S.answered++; if (ok) S.correct++;
-    S.timeMs += Math.min(ms, 180000);
-    const st = S.stats[q.ch] || (S.stats[q.ch] = [0, 0, 0]);
-    st[1]++; if (ok) st[0]++; st[2] += Math.min(ms, 180000);
+    const d = me(), t = Math.min(ms, 180000);
+    d.answered++; S.answered++; if (ok) { d.correct++; S.correct++; }
+    d.timeMs += t; S.timeMs += t;
+    for (const st of [d.stats[q.ch] || (d.stats[q.ch] = [0, 0, 0]), S.stats[q.ch] || (S.stats[q.ch] = [0, 0, 0])]) { st[1]++; if (ok) st[0]++; st[2] += t; }
     if (!ok) S.mistakes[q.id] = { ch: q.ch, seed: q.seed, lvl: q.lvl, t: Date.now() };
-    else if (S.mistakes[q.id] && kind === 'mistakes') { delete S.mistakes[q.id]; S.fixed[q.id] = Date.now(); S.fixedCount++; }
+    else if (S.mistakes[q.id] && kind === 'mistakes') { delete S.mistakes[q.id]; S.fixed[q.id] = Date.now(); d.fixedCount++; S.fixedCount++; }
     const ks = Object.keys(S.mistakes);
     if (ks.length > 300) ks.sort((a, b) => S.mistakes[a].t - S.mistakes[b].t).slice(0, ks.length - 300).forEach((k) => delete S.mistakes[k]);
   }
@@ -2540,8 +2629,8 @@ Penguins eat cold fish
     const ok = i === q.ans, ms = Date.now() - Q.qStart;
     Q.answers[Q.i] = { pick: i, ok, ms };
     record(q, ok, ms, Q.kind);
-    if (ok) { Q.streak++; Q.best = Math.max(Q.best, Q.streak); S.bestStreak = Math.max(S.bestStreak, Q.streak); const g = 10 + (Q.streak >= 5 ? 5 : 0); Q.xp += g; S.xp += g; sfx.ok(); }
-    else { Q.streak = 0; Q.xp += 2; S.xp += 2; sfx.no(); }
+    if (ok) { Q.streak++; Q.best = Math.max(Q.best, Q.streak); S.bestStreak = Math.max(S.bestStreak, Q.streak); const g = 10 + (Q.streak >= 5 ? 5 : 0); Q.xp += g; addXP(g); sfx.ok(); }
+    else { Q.streak = 0; Q.xp += 2; addXP(2); sfx.no(); }
     save();
     render();
     const el = app.querySelector(`.opt[data-i="${i}"]`);
@@ -2564,19 +2653,20 @@ Penguins eat cold fish
     if (Q.kind === 'set' || Q.kind === 'mix') {
       const key = Q.kind === 'mix' ? 'mix.' + Q.set : Q.ch + '.' + Q.set, prev = S.sets[key] || { best: 0, stars: 0, n: 0 };
       const st = starsFor(c, n); Q.stars = st; Q.newBest = c > prev.best;
-      const bonus = Math.max(0, st - prev.stars) * 15; Q.xp += bonus; S.xp += bonus;
+      const bonus = Math.max(0, st - prev.stars) * 15; Q.xp += bonus; addXP(bonus);
       S.sets[key] = { best: Math.max(prev.best, c), stars: Math.max(prev.stars, st), n: prev.n + 1 };
       if (st === 3 && (Q.kind === 'mix' ? PP.mixLevel(Q.set) : PP.setLevelOf(PP.byId[Q.ch], Q.set)) === 3) ev.expert3 = true;
       const avg = Q.answers.reduce((s, a) => s + (a ? a.ms : 0), 0) / Math.max(1, n) / 1000;
       if (c >= 9 && avg < 30) ev.speedy = true;
       if (Q.kind === 'set') S.last = Q.ch;
     }
-    if (Q.kind === 'daily' && S.daily[today()] === undefined) { S.daily[today()] = c; Q.xp += 50; S.xp += 50; Q.dailyBonus = true; }
+    if (Q.kind === 'daily' && S.daily[today()] === undefined) { S.daily[today()] = c; Q.xp += 50; addXP(50); Q.dailyBonus = true; }
     save();
     view = { name: 'result' };
     render(); window.scrollTo(0, 0);
     if (n && c / n >= 0.8) { confetti(c === n ? 1.6 : 1); sfx.win(); }
     checkBadges(ev);
+    Cloud.sync();
   }
 
   // ================= tests =================
@@ -2607,7 +2697,7 @@ Penguins eat cold fish
     let c = 0, n = 0;
     T.secs.forEach((s, si) => { s.c = 0; s.refs.forEach((_, i) => { const q = tq(si, i); const p = s.picks[i]; n++; if (p === q.ans) { c++; s.c++; } if (p !== null) record(q, p === q.ans, T.times[si + ':' + i] || 30000, 'test'); }); });
     T.c = c; T.n = n; T.pct = Math.round((100 * c) / n);
-    const gain = c * 5; S.xp += gain; T.xp = gain;
+    const gain = c * 5; addXP(gain); T.xp = gain;
     S.tests.unshift({ id: T.tid, form: PP.FORMS[T.form], c, n, pct: T.pct, date: Date.now(), secs: T.secs.map((s) => [s.title, s.c, s.refs.length, s.used]) });
     S.tests = S.tests.slice(0, 60);
     save();
@@ -2615,6 +2705,7 @@ Penguins eat cold fish
     render(); window.scrollTo(0, 0);
     if (T.pct >= 80) { confetti(1.4); sfx.win(); }
     checkBadges({});
+    Cloud.sync();
   }
   function testMove(to) {
     const k = T.si + ':' + T.i; T.times[k] = (T.times[k] || 0) + (Date.now() - T.qStart); T.qStart = Date.now();
@@ -2821,7 +2912,7 @@ Penguins eat cold fish
     const acc = S.answered ? Math.round((100 * S.correct) / S.answered) : 0;
     const pill = (p) => `<span class="pill ${p >= 80 ? 'good' : p >= 60 ? 'mid' : 'low'}">${p}%</span>`;
     const weak = PP.chapters.filter((c) => S.stats[c.id] && S.stats[c.id][1] >= 10).map((c) => [c, S.stats[c.id][0] / S.stats[c.id][1]]).sort((a, b) => a[1] - b[1]).filter((x) => x[1] < 0.7).slice(0, 4);
-    return `<main class="wrap">${backBtn('home', 'Home')}<h1>Progress report</h1><p class="muted">For parents and puzzlers. ${Sync.on ? 'Progress is synced across devices signed in to this account.' : 'Progress is saved in this browser on this device.'}</p>
+    return `<main class="wrap">${backBtn('home', 'Home')}<h1>Progress report</h1><p class="muted">For parents and puzzlers. ${Cloud.on() ? 'Progress is synced between his devices with your family code.' : Sync.on ? 'Progress is synced across devices signed in to this account.' : 'Progress is saved in this browser on this device.'}</p>
       <section class="section"><div class="statrow" style="justify-content:flex-start"><div class="stat"><b>${S.answered}</b><span>questions answered</span></div><div class="stat"><b>${acc}%</b><span>correct overall</span></div><div class="stat"><b>${Math.round(S.timeMs / 60000)} min</b><span>practice time</span></div><div class="stat"><b>${S.bestStreak}</b><span>best streak</span></div><div class="stat"><b>${S.tests.length}</b><span>tests taken</span></div><div class="stat"><b>${Object.keys(S.badges).length}/${BADGES.length}</b><span>badges</span></div></div></section>
       ${weak.length ? `<section class="section tipbox"><b>Worth more practice:</b> ${weak.map(([c, p]) => `<button class="back" style="display:inline;margin:0 8px 0 0" data-go="${c.id}">${esc(c.name)} (${Math.round(p * 100)}%)</button>`).join('')}</section>` : ''}
       ${PP.groups.map((g) => `<section class="section"><div class="section-head" style="--g:${GCOL[g.id]}"><span class="grp-dot"></span><h2>${g.name}</h2></div><div class="tablewrap"><table class="plain"><thead><tr><th>Chapter</th><th class="n">Answered</th><th class="n">Correct</th><th class="n">Avg time</th><th class="n">Sets</th><th class="n">Stars</th></tr></thead><tbody>${PP.chapters.filter((c) => c.group === g.id).map((c) => { const st = S.stats[c.id]; return `<tr><td><button class="back" style="margin:0" data-go="${c.id}">${esc(c.name)}</button></td><td class="n">${st ? st[1] : 0}</td><td class="n">${st ? pill(Math.round((100 * st[0]) / st[1])) : '–'}</td><td class="n">${st ? Math.round(st[2] / st[1] / 1000) + 's' : '–'}</td><td class="n">${chDone(c)}/${PP.setCount(c)}</td><td class="n">${chStars(c)}</td></tr>`; }).join('')}</tbody></table></div></section>`).join('')}
@@ -2835,8 +2926,8 @@ Penguins eat cold fish
   const pinHash = (pin) => PP.hash('pp-pin:' + pin).toString(36);
   const b64 = (u8) => { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); };
   const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
-  async function packState() {
-    const json = JSON.stringify(Object.assign({}, S, { parent: undefined }));
+  async function packState(forCloud) {
+    const json = JSON.stringify(Object.assign({}, S, forCloud ? { parent: undefined, name: undefined, sound: undefined } : { parent: undefined }));
     try { const buf = await new Response(new Blob([json]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer(); return 'PP1' + b64(new Uint8Array(buf)); }
     catch (e) { return 'PP0' + b64(new TextEncoder().encode(json)); }
   }
@@ -2849,29 +2940,46 @@ Penguins eat cold fish
   function vProfile() {
     const P = S.parent || { pin: '', lock: false }, ok = !P.pin || view.parentOk;
     const parent = !P.pin
-      ? `<p class="small muted" style="margin:0">Set a PIN so only you can change these settings or reset progress.</p>
+      ? `<p class="small muted" style="margin:0">Set a PIN so only you can change these settings, sync, or reset progress.</p>
         <label for="pp-pin">New parent PIN (4–8 digits)<input id="pp-pin" type="password" inputmode="numeric" maxlength="8" autocomplete="off"></label>
         <label style="display:flex;gap:10px;align-items:center;font-weight:400"><input id="pp-lock" type="checkbox" checked> Mixed practice only (hides single-skill chapters and single-skill tests)</label>
         <div><button class="btn" data-act="setpin">Save parent settings</button></div>`
       : !view.parentOk
-        ? `<p class="small" style="margin:0">Mixed practice only is <b>${P.lock ? 'on' : 'off'}</b>. Enter the parent PIN to change it.</p>
+        ? `<p class="small" style="margin:0">Mixed practice only is <b>${P.lock ? 'on' : 'off'}</b>. Enter the parent PIN to change settings.</p>
         <label for="pp-pin-in">Parent PIN<input id="pp-pin-in" type="password" inputmode="numeric" maxlength="8" autocomplete="off"></label><div><button class="btn" data-act="unlockparent">Unlock</button></div>`
         : `<label style="display:flex;gap:10px;align-items:center;font-weight:400"><input id="pp-lock" type="checkbox" ${P.lock ? 'checked' : ''}> Mixed practice only (hides single-skill chapters and single-skill tests)</label>
         <div class="row"><button class="btn" data-act="savelock">Save</button><button class="btn ghost" data-act="droppin">Remove PIN</button></div>`;
+    const sync = !Cloud.available() ? '' : `<section class="section form"><h3>Sync between devices</h3>
+        <p class="small" id="pp-sync-status" style="margin:0">${Cloud.statusText()}</p>
+        <p class="small muted" style="margin:0">Keeps his iPad, phone and computer in step and backs progress up online. Only progress is stored (stars, scores, mistakes) under a random family code. No names, emails or accounts.</p>
+        ${!ok ? '<p class="small muted" style="margin:0">Unlock parent controls above to change sync.</p>' : !Cloud.on() ? `
+        <div><button class="btn sun" data-act="sync-on">Turn on sync</button></div>
+        <label for="pp-key-in">Already turned on for another device? Enter its family code<input id="pp-key-in" type="text" placeholder="peak-xxxx-xxxx-xxxx-xxxx" autocomplete="off" autocapitalize="none" spellcheck="false"></label>
+        <div><button class="btn ghost" data-act="sync-join">Join</button></div>` : `
+        <p style="margin:0">Family code: <code class="code">${esc(C.key)}</code> <button class="back" style="display:inline;margin:0 0 0 6px" data-act="sync-copy">Copy</button></p>
+        <p class="small muted" style="margin:0">On each of his other devices: Profile → Sync between devices → enter this code → Join. Keep it private; anyone with the code can see and change this progress.</p>
+        <div class="row"><button class="btn" data-act="sync-now">Sync now</button><button class="btn ghost" data-act="sync-off">Stop syncing on this device</button><button class="btn ghost" data-act="sync-askdel">Delete our online copy…</button></div>
+        ${view.askDel ? `<div class="confirm"><span class="grow">This deletes the online copy for every device using this code. Progress saved on each device stays.</span><button class="btn ghost" data-act="sync-nodel">Cancel</button><button class="btn" style="background:var(--bad)" data-act="sync-del">Delete online copy</button></div>` : ''}`}
+        ${view.syncMsg ? `<p class="small" style="margin:0">${esc(view.syncMsg)}</p>` : ''}</section>`;
+    const canFile = window.self === window.top;
     return `<main class="wrap">${backBtn('home', 'Home')}<h1>Profile</h1>
       <form class="form" data-form="profile" style="margin-top:16px"><label for="pp-name">Your name<input id="pp-name" type="text" maxlength="24" value="${esc(S.name)}" placeholder="e.g. Arjun" autocomplete="off"></label>
+        <span class="small muted">Your name stays on this device. It is never sent anywhere.</span>
         <label style="display:flex;gap:10px;align-items:center;font-weight:400"><input id="pp-sound" type="checkbox" ${S.sound ? 'checked' : ''}> Sounds on</label>
         <div><button class="btn" type="submit">Save</button></div></form>
       <section class="section form"><h3>Parent controls</h3>${parent}${view.pmsg ? `<p class="small" style="margin:0">${esc(view.pmsg)}</p>` : ''}</section>
-      <section class="section form"><h3>Move progress to another device</h3>
-        <p class="small muted" style="margin:0">${Sync.on ? 'Progress already syncs while you are signed in. Codes are for devices that aren’t.' : 'Each device keeps its own progress.'} Make a code here, send it to the other device (AirDrop, Messages or email), and paste it there. Progress from both devices is combined, so nothing is lost.</p>
-        <div class="row"><button class="btn ghost" data-act="mkcode">Make transfer code</button>${view.code ? '<button class="btn ghost" data-act="copycode">Copy code</button>' : ''}</div>
-        ${view.code ? `<textarea id="pp-code-out" readonly rows="3" aria-label="Transfer code">${view.code}</textarea>` : ''}
-        <label for="pp-code-in">Paste a code from another device<textarea id="pp-code-in" rows="3" placeholder="PP1…"></textarea></label>
-        <div><button class="btn" data-act="usecode">Add this progress</button></div>
+      ${sync}
+      <section class="section form"><h3>Backup</h3>
+        <p class="small muted" style="margin:0">${canFile ? 'Save a backup file (for example to iCloud Drive or Files). Loading it adds its progress to this device, so nothing is lost.' : 'Copy a backup code and keep it somewhere safe. Pasting it back adds its progress to this device.'}</p>
+        ${canFile ? '<div class="row"><button class="btn ghost" data-act="file-save">Save backup file</button><label class="btn ghost" for="pp-file" style="cursor:pointer">Load backup file</label><input id="pp-file" type="file" accept=".json,application/json" hidden></div>' : ''}
+        <details${view.code || view.codeMsg ? ' open' : ''}><summary class="small">Use a copy-and-paste code instead</summary><div class="stack" style="margin-top:10px">
+          <div class="row"><button class="btn ghost" data-act="mkcode">Make code</button>${view.code ? '<button class="btn ghost" data-act="copycode">Copy code</button>' : ''}</div>
+          ${view.code ? `<textarea id="pp-code-out" readonly rows="3" aria-label="Backup code">${view.code}</textarea>` : ''}
+          <label for="pp-code-in">Paste a code<textarea id="pp-code-in" rows="3" placeholder="PP1…"></textarea></label>
+          <div><button class="btn" data-act="usecode">Add this progress</button></div></div></details>
         ${view.codeMsg ? `<p class="small" style="margin:0">${esc(view.codeMsg)}</p>` : ''}</section>
-      <section class="section form"><h3>Reset</h3>${!ok ? '<p class="small muted" style="margin:0">Unlock parent controls above to reset progress.</p>' : view.reset ? `<div class="confirm"><span class="grow">This erases all stars, badges, XP and saved mistakes. Are you sure?</span><button class="btn ghost" data-act="noreset">Cancel</button><button class="btn" style="background:var(--bad)" data-act="doreset">Erase everything</button></div>` : '<div><button class="btn ghost" data-act="askreset">Reset all progress…</button></div>'}</section>
-      <p><button class="back" data-go="about">About the questions and sources</button></p></main>`;
+      <section class="section form"><h3>Reset</h3>${!ok ? '<p class="small muted" style="margin:0">Unlock parent controls above to reset progress.</p>' : view.reset ? `<div class="confirm"><span class="grow">This erases all stars, badges, XP and saved mistakes${Cloud.on() ? ' on every synced device' : ''}. Are you sure?</span><button class="btn ghost" data-act="noreset">Cancel</button><button class="btn" style="background:var(--bad)" data-act="doreset">Erase everything</button></div>` : '<div><button class="btn ghost" data-act="askreset">Reset all progress…</button></div>'}</section>
+      <p><button class="back" data-go="about">About the questions, privacy and sources</button></p></main>`;
   }
   function vAbout() {
     return `<main class="wrap prose">${backBtn('home', 'Home')}<h1>About the questions</h1>
@@ -2886,6 +2994,9 @@ Penguins eat cold fish
       <p>Most number, shape and logic questions are built by a program from a rule, so the answer is always checked and the explanation shows the rule. Word questions are written by hand.</p>
       <p><b>Difficulty:</b> sets 1–3 are Warm-up (about grade 3–4), 4–7 Challenge (grade 4–5), and 8–10 Expert (grade 5–7).</p>
       <p><b>Free official practice worth knowing about:</b> past contests from the <a href="https://cemc.uwaterloo.ca/contests" target="_blank" rel="noopener">University of Waterloo CEMC</a>, and sample problems from <a href="https://mathkangaroo.org" target="_blank" rel="noopener">Math Kangaroo</a>. Test publishers: <a href="https://www.riversideinsights.com" target="_blank" rel="noopener">Riverside Insights</a> (CogAT), <a href="https://www.nelson.com" target="_blank" rel="noopener">Nelson</a> (CCAT), <a href="https://www.pearsonassessments.com" target="_blank" rel="noopener">Pearson</a> (OLSAT, NNAT), <a href="https://www.erblearn.org" target="_blank" rel="noopener">ERB</a> (ISEE).</p>
+      <h2 style="margin-top:28px">Privacy</h2>
+      <p>Puzzle Peak has no accounts, no ads and no tracking. Everything is saved in the browser on each device. Your name never leaves the device.</p>
+      <p>If a parent turns on <b>Sync between devices</b>, a compressed copy of the progress (stars, scores, XP, saved mistakes and test results) is stored online under a random family code. The code itself isn’t stored, only a scrambled fingerprint of it. Nothing else is kept: no names, emails, locations or device details. A parent can delete the online copy at any time from Profile.</p>
       <p class="small muted">Puzzle Peak is an independent practice tool. It is not affiliated with or endorsed by any test publisher. Scores here are practice scores, not official percentiles.</p>
     </main>`;
   }
@@ -2934,11 +3045,35 @@ Penguins eat cold fish
     else if (act === 'unlockparent') { if (pinHash(document.getElementById('pp-pin-in').value.trim()) === S.parent.pin) { view.parentOk = true; view.pmsg = ''; } else view.pmsg = 'That PIN doesn’t match.'; render(); }
     else if (act === 'savelock') { S.parent.lock = document.getElementById('pp-lock').checked; view.pmsg = 'Saved.'; save(); render(); }
     else if (act === 'droppin') { S.parent = { pin: '', lock: false }; view.parentOk = false; view.pmsg = 'PIN removed. Every chapter is open.'; save(); render(); }
+    else if (act === 'sync-on') { C = { key: newFamilyCode() }; Cloud.saveCfg(); view.syncMsg = 'Sync is on. Enter the family code on his other devices.'; render(); Cloud.sync(); }
+    else if (act === 'sync-join') { const k = document.getElementById('pp-key-in').value.trim().toLowerCase().replace(/\s+/g, ''); if (!KEY_RE.test(k)) { view.syncMsg = 'That doesn’t look like a family code. It starts with “peak-” and has four groups of four letters or numbers.'; render(); return; } C = { key: k }; Cloud.saveCfg(); view.syncMsg = 'Joined. Progress from all devices with this code is being combined.'; render(); Cloud.sync(); }
+    else if (act === 'sync-now') Cloud.sync();
+    else if (act === 'sync-copy') navigator.clipboard.writeText(C.key).then(() => toast('<div>Family code copied.</div>'), () => toast(`<div>${esc(C.key)}</div>`));
+    else if (act === 'sync-off') { C = {}; Cloud.saveCfg(); view.syncMsg = 'Sync is off on this device. Its progress stays here.'; render(); }
+    else if (act === 'sync-askdel') { view.askDel = true; render(); }
+    else if (act === 'sync-nodel') { view.askDel = false; render(); }
+    else if (act === 'sync-del') { Cloud.call('/v1/delete', { key: C.key }).then((r) => { view.askDel = false; if (r.ok) { C = {}; Cloud.saveCfg(); view.syncMsg = 'The online copy is deleted and sync is off on this device.'; } else view.syncMsg = 'Couldn’t delete it just now. Check the internet connection and try again.'; render(); }); }
+    else if (act === 'file-save') saveBackupFile();
     else if (act === 'mkcode') { packState().then((c) => { view.code = c; view.codeMsg = ''; render(); }); }
     else if (act === 'copycode') { const ta = document.getElementById('pp-code-out'); navigator.clipboard.writeText(view.code).then(() => toast('<div>Code copied.</div>'), () => { ta.focus(); ta.select(); }); }
     else if (act === 'usecode') { unpackState(document.getElementById('pp-code-in').value).then((inc) => { S = merge(S, inc); save(); view.codeMsg = `Added! You now have ${S.answered} answers and ${Object.keys(S.badges).length} badges here.`; render(); }, () => { view.codeMsg = 'That code didn’t work. Copy the whole code and try again.'; render(); }); }
-    else if (act === 'doreset') { const keepName = S.name, keepParent = S.parent; S = blank(); S.name = keepName; S.parent = keepParent; save(); view.reset = false; toast('<div>Progress erased.</div>'); render(); }
+    else if (act === 'doreset') { const keepName = S.name, keepParent = S.parent; S = blank(); S.name = keepName; S.parent = keepParent; S.epoch = { id: rid(), t: Date.now() }; save(); Cloud.sync(); view.reset = false; toast('<div>Progress erased.</div>'); render(); }
   });
+  app.addEventListener('change', (e) => {
+    if (e.target.id !== 'pp-file' || !e.target.files[0]) return;
+    e.target.files[0].text().then((txt) => unpackState(JSON.parse(txt).code)).then((inc) => { S = merge(S, inc); save(); view.codeMsg = `Backup loaded. You now have ${S.answered} answers and ${Object.keys(S.badges).length} badges here.`; render(); Cloud.sync(); }, () => { view.codeMsg = 'That file isn’t a Puzzle Peak backup.'; render(); });
+  });
+  async function saveBackupFile() {
+    const code = await packState();
+    const name = `puzzle-peak-backup-${today()}.json`;
+    const blob = new Blob([JSON.stringify({ app: 'puzzle-peak', saved: new Date().toISOString(), code })], { type: 'application/json' });
+    const file = new File([blob], name, { type: 'application/json' });
+    try { if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: 'Puzzle Peak backup' }); return; } } catch (e) { if (e && e.name === 'AbortError') return; }
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  }
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && Date.now() - Cloud.lastTry > 60000) Cloud.sync(); });
+  window.addEventListener('online', () => Cloud.sync());
+  setInterval(() => { if (document.visibilityState === 'visible' && Date.now() - Cloud.lastTry > 4 * 60000) Cloud.sync(); }, 60000);
   app.addEventListener('submit', (e) => {
     const f = e.target.closest('[data-form="profile"]');
     if (!f) return;
@@ -2976,6 +3111,8 @@ Penguins eat cold fish
       render();
     } else route(location.hash.slice(1));
     Sync.init();
+    Cloud.sync();
+    try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch (e) { /* not supported */ }
   }
   const hot = window.claude && window.claude.hot;
   if (hot && hot.ready) hot.ready(start); else start((hot && hot.data) || {});

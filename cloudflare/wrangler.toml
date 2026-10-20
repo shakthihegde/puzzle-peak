@@ -1,0 +1,11 @@
+name = "puzzle-peak-sync"
+main = "src/worker.js"
+compatibility_date = "2025-09-01"
+
+[vars]
+ALLOWED_ORIGINS = "https://shakthihegde.github.io"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "puzzle-peak"
+database_id = "56bc4486-b8ce-4dc4-ae48-fd8409bc3f6c"
