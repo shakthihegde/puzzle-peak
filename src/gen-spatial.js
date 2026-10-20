@@ -152,7 +152,7 @@
       h[x][y] = x === 0 && y === 0 ? r.int(Math.max(1, Hm - 1), Hm) : r.int(lvl === 1 ? 1 : 0, lim);
     }
     const total = PP.sum(h.flat());
-    if (total < 4) throw new Error('small');
+    if (total < 4 || Math.max(...h.flat()) < 2) throw new Error('too simple: needs at least one stack');
     const a = 17.3, b = 10, cz = 20;
     const P = (x, y, z) => [(x - y) * a, (x + y) * b - z * cz];
     const cubes = [];
@@ -173,10 +173,12 @@
     if (hidden) wrongs.push(num(total - hidden, 'That counts only the cubes you can see. Some cubes are hidden underneath, holding the others up.'));
     wrongs.push(num(tops, 'That counts only the top faces. Some stacks are more than one cube tall.'));
     wrongs.push(num(total - 1, 'One cube is missing from the count. Did you count the hidden ones?'));
-    const res = mc(r, num(total), wrongs.concat(PP.nearMiss(total)), 5);
+    const big = 'Count only the small cubes. Small cubes side by side don’t make an extra big cube: a bigger cube needs 2 × 2 × 2 = 8 small cubes in two layers.';
+    wrongs.push(num(total + 1, big));
+    const res = mc(r, num(total), wrongs.concat(PP.nearMiss(total).map((w) => Object.assign(w, { why: 'Count again, one stack at a time, starting from the back.' }))), 5);
     const view = `<table class="topview">${PP.range(D).map((y) => `<tr>${PP.range(W).map((x) => `<td>${h[x][y]}</td>`).join('')}</tr>`).join('')}</table>`;
-    return Object.assign({ prompt: 'How many cubes are in this stack? (Every cube is resting on the table or on another cube, so some may be hidden.)', stem: `<div class="srow">${pic}</div>`,
-      explain: `<p>Count each stack from the top. Seen from above, the heights are:</p>${view}<p>${h.flat().filter((v) => v).join(' + ')} = <b>${total}</b> cubes.</p>` }, res);
+    return Object.assign({ prompt: 'How many <b>small cubes</b> were used to build this? (Every cube rests on the table or on another cube, so some may be hidden.)', stem: `<div class="srow">${pic}</div>`,
+      explain: `<p>Count each stack from the top. Seen from above, the heights are:</p>${view}<p>${h.flat().filter((v) => v).join(' + ')} = <b>${total}</b> small cubes.</p><p class="small">Only count the small cubes. They don’t join up into an extra big cube: a bigger cube would need 2 × 2 × 2 = 8 of them.</p>` }, res);
   }
 
   // ================= FOLLOWING DIRECTIONS (OLSAT) =================
